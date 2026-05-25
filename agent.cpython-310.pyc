@@ -1,0 +1,420 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List
+from langchain_core.tools import tool
+from kubernetes import client, config
+from agent.config import get_settings
+
+cfg = get_settings()
+
+# ─────────────────────────────────────────────
+# LOAD KUBECONFIG ONCE
+# ─────────────────────────────────────────────
+
+def _load_kube():
+    if cfg.kubeconfig_path:
+        config.load_kube_config(config_file=cfg.kubeconfig_path)
+    else:
+        config.load_incluster_config()
+
+
+# ─────────────────────────────────────────────
+# TOOL 1: NODE STATUS
+# ─────────────────────────────────────────────
+
+@tool
+def get_node_status() -> List[Dict[str, Any]]:
+    """Get node health status with all conditions"""
+    try:
+        _load_kube()
+        v1 = client.CoreV1Api()
+        nodes = v1.list_node()
+        result = []
+        for node in nodes.items:
+            name = node.metadata.name
+
+            # Role detection
+            labels = node.metadata.labels or {}
+            if (
+                "node-role.kubernetes.io/master" in labels
+                or "node-role.kubernetes.io/control-plane" in labels
+            ):
+                role = "master"
+            else:
+                role = "worker"
+
+            # Parse ALL conditions into a lookup dict
+            # condition.type → condition.status ("True"/"False"/"Unknown")
+            cond_map = {}
+            for condition in (node.status.conditions or []):
+                cond_map[condition.type] = condition.status
+
+            # Ready: True = Ready, anything else = NotReady
+            ready = cond_map.get("Ready", "Unknown") == "True"
+
+            # Pressure conditions: True = problem exists
+            disk_pressure       = cond_map.get("DiskPressure",       "False") == "True"
+            memory_pressure     = cond_map.get("MemoryPressure",     "False") == "True"
+            pid_pressure        = cond_map.get("PIDPressure",        "False") == "True"
+            network_unavailable = cond_map.get("NetworkUnavailable", "False") == "True"
+
+            result.append({
+                "name":               name,
+                "role":               role,
+                "status":             "Ready" if ready else "NotReady",
+                "ready":              ready,
+                "disk_pressure":      disk_pressure,
+                "memory_pressure":    memory_pressure,
+                "pid_pressure":       pid_pressure,
+                "network_unavailable": network_unavailable,
+            })
+        return result
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────
+# TOOL 2: CLUSTER OPERATORS
+# ─────────────────────────────────────────────
+
+@tool
+def get_cluster_operators() -> List[Dict[str, Any]]:
+    """Get cluster operators status"""
+    try:
+        _load_kube()
+        custom = client.CustomObjectsApi()
+        cos = custom.list_cluster_custom_object(
+            group="config.openshift.io",
+            version="v1",
+            plural="clusteroperators"
+        )
+        result = []
+        for co in cos.get("items", []):
+            name = co["metadata"]["name"]
+            conditions = co.get("status", {}).get("conditions", [])
+
+            available  = True
+            degraded   = False
+            progressing = False
+            message    = ""
+
+            for c in conditions:
+                if c["type"] == "Available" and c["status"] == "False":
+                    available = False
+                    message = c.get("message", "")
+                if c["type"] == "Degraded" and c["status"] == "True":
+                    degraded = True
+                    message = c.get("message", "")
+                if c["type"] == "Progressing" and c["status"] == "True":
+                    progressing = True
+
+            result.append({
+                "name": name,
+                "available": available,
+                "degraded": degraded,
+                "progressing": progressing,
+                "message": message[:200] if message else "",
+            })
+        return result
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────
+# TOOL 3: MACHINE CONFIG POOLS
+# ─────────────────────────────────────────────
+
+@tool
+def get_machine_config_pools() -> List[Dict[str, Any]]:
+    """Get machine config pool status"""
+    try:
+        _load_kube()
+        custom = client.CustomObjectsApi()
+        mcps = custom.list_cluster_custom_object(
+            group="machineconfiguration.openshift.io",
+            version="v1",
+            plural="machineconfigpools"
+        )
+        result = []
+        for mcp in mcps.get("items", []):
+            name = mcp["metadata"]["name"]
+            conditions = mcp.get("status", {}).get("conditions", [])
+            degraded = any(
+                c["type"] == "Degraded" and c["status"] == "True"
+                for c in conditions
+            )
+            message = next(
+                (c.get("message", "") for c in conditions
+                 if c["type"] == "Degraded" and c["status"] == "True"),
+                ""
+            )
+            result.append({
+                "name": name,
+                "degraded": degraded,
+                "message": message[:200] if message else "",
+            })
+        return result
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────
+# TOOL 4: ETCD HEALTH
+# ─────────────────────────────────────────────
+
+@tool
+def get_etcd_health() -> Dict[str, Any]:
+    """Get etcd cluster health"""
+    try:
+        _load_kube()
+        v1 = client.CoreV1Api()
+        pods = v1.list_namespaced_pod(namespace="openshift-etcd")
+        endpoints = []
+        all_healthy = True
+        for pod in pods.items:
+            name = pod.metadata.name
+            if not name.startswith("etcd-"):
+                continue
+            healthy = pod.status.phase == "Running"
+            if not healthy:
+                all_healthy = False
+            endpoints.append({
+                "endpoint": name,
+                "healthy": healthy,
+                "phase": pod.status.phase,
+            })
+        return {
+            "healthy": all_healthy,
+            "member_count": len(endpoints),
+            "endpoints": endpoints,
+        }
+    except Exception as e:
+        return {"healthy": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────
+# TOOL 5: PVC ISSUES (cp4i focused)
+# ─────────────────────────────────────────────
+
+@tool
+def get_pvc_issues() -> List[Dict[str, Any]]:
+    """Get PVC issues in monitored namespaces"""
+    try:
+        _load_kube()
+        v1 = client.CoreV1Api()
+        namespaces = cfg.monitored_namespaces_list
+        result = []
+        for ns in namespaces:
+            try:
+                pvcs = v1.list_namespaced_persistent_volume_claim(namespace=ns)
+                for pvc in pvcs.items:
+                    phase = pvc.status.phase
+                    if phase in ("Pending", "Lost") or (
+                        pvc.metadata.deletion_timestamp and phase != "Bound"
+                    ):
+                        result.append({
+                            "name": pvc.metadata.name,
+                            "namespace": ns,
+                            "phase": phase,
+                            "storage_class": pvc.spec.storage_class_name or "",
+                            "capacity": str(pvc.spec.resources.requests.get("storage", "")) if pvc.spec.resources else "",
+                            "terminating": bool(pvc.metadata.deletion_timestamp),
+                        })
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────
+# TOOL 6: FAILING PODS (cp4i focused)
+# ─────────────────────────────────────────────
+
+@tool
+def get_failing_pods() -> List[Dict[str, Any]]:
+    """Get failing pods in monitored namespaces"""
+    try:
+        _load_kube()
+        v1 = client.CoreV1Api()
+        namespaces = cfg.monitored_namespaces_list
+        result = []
+
+        BAD_REASONS = {"CrashLoopBackOff", "OOMKilled", "Error",
+                       "ImagePullBackOff", "ErrImagePull", "CreateContainerError"}
+
+        for ns in namespaces:
+            try:
+                pods = v1.list_namespaced_pod(namespace=ns)
+                for pod in pods.items:
+                    phase = pod.status.phase
+                    if phase in ("Succeeded", "Running"):
+                        # check container statuses anyway
+                        pass
+                    
+                    containers = []
+                    for cs in (pod.status.container_statuses or []):
+                        reason = ""
+                        message = ""
+                        restart_count = cs.restart_count or 0
+
+                        if cs.state.waiting:
+                            reason = cs.state.waiting.reason or ""
+                            message = cs.state.waiting.message or ""
+                        elif cs.state.terminated:
+                            reason = cs.state.terminated.reason or ""
+                            message = cs.state.terminated.message or ""
+
+                        if reason in BAD_REASONS or restart_count > 3:
+                            containers.append({
+                                "name": cs.name,
+                                "reason": reason,
+                                "restart_count": restart_count,
+                                "message": message[:200] if message else "",
+                            })
+
+                    # Also catch pods stuck in non-running phases
+                    stuck = phase in ("Pending", "Unknown", "Failed")
+
+                    if containers or stuck:
+                        result.append({
+                            "name": pod.metadata.name,
+                            "namespace": ns,
+                            "phase": phase,
+                            "containers": containers,
+                        })
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────
+# TOOL 7: CERT EXPIRY
+# ─────────────────────────────────────────────
+
+@tool
+def get_expiring_certs() -> List[Dict[str, Any]]:
+    """Get expiring TLS certificates in monitored namespaces"""
+    try:
+        from datetime import datetime, timezone
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+        import base64
+
+        _load_kube()
+        v1 = client.CoreV1Api()
+        namespaces = cfg.monitored_namespaces_list
+        result = []
+        now = datetime.now(timezone.utc)
+        warn_days = cfg.cert_expiry_warning_days
+
+        for ns in namespaces:
+            try:
+                secrets = v1.list_namespaced_secret(namespace=ns)
+                for secret in secrets.items:
+                    if secret.type != "kubernetes.io/tls":
+                        continue
+                    cert_data = (secret.data or {}).get("tls.crt")
+                    if not cert_data:
+                        continue
+                    try:
+                        cert_bytes = base64.b64decode(cert_data)
+                        cert = x509.load_pem_x509_certificate(cert_bytes, default_backend())
+                        expiry = cert.not_valid_after_utc
+                        days_remaining = (expiry - now).days
+                        if days_remaining <= warn_days:
+                            result.append({
+                                "secret_name": secret.metadata.name,
+                                "namespace": ns,
+                                "days_remaining": days_remaining,
+                                "expiry": expiry.isoformat(),
+                            })
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────
+# TOOL 8: CP4I ENDPOINTS
+# ─────────────────────────────────────────────
+
+@tool
+def check_cp4i_endpoints() -> List[Dict[str, Any]]:
+    """Check CP4I platform navigator and component health"""
+    try:
+        import httpx
+        _load_kube()
+        custom = client.CustomObjectsApi()
+        result = []
+
+        # Check PlatformNavigator CR status
+        try:
+            navigators = custom.list_namespaced_custom_object(
+                group="integration.ibm.com",
+                version="v1beta2",
+                namespace="cp4i",
+                plural="platformnavigators"
+            )
+            for nav in navigators.get("items", []):
+                name = nav["metadata"]["name"]
+                conditions = nav.get("status", {}).get("conditions", [])
+                ready = any(
+                    c.get("type") == "Ready" and c.get("status") == "True"
+                    for c in conditions
+                )
+                message = next(
+                    (c.get("message", "") for c in conditions
+                     if c.get("type") == "Ready" and c.get("status") != "True"),
+                    ""
+                )
+                result.append({
+                    "name": name,
+                    "kind": "PlatformNavigator",
+                    "healthy": ready,
+                    "message": message[:200] if message else "",
+                })
+        except Exception:
+            pass
+
+        # Check configured HTTP endpoints if any
+        for url in cfg.cp4i_endpoints_list:
+            try:
+                resp = httpx.get(url, timeout=10, verify=False)
+                result.append({
+                    "url": url,
+                    "healthy": resp.status_code < 400,
+                    "status_code": resp.status_code,
+                })
+            except Exception as e:
+                result.append({
+                    "url": url,
+                    "healthy": False,
+                    "status_code": 0,
+                    "error": str(e),
+                })
+
+        return result
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+# ─────────────────────────────────────────────
+# TOOL REGISTRY
+# ─────────────────────────────────────────────
+
+TOOL_REGISTRY = {
+    "nodes":     get_node_status,
+    "operators": get_cluster_operators,
+    "mcpools":   get_machine_config_pools,
+    "etcd":      get_etcd_health,
+    "pvcs":      get_pvc_issues,
+    "pods":      get_failing_pods,
+    "certs":     get_expiring_certs,
+    "cp4i":      check_cp4i_endpoints,
+}

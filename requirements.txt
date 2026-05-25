@@ -1,0 +1,44 @@
+# ── Core Agent Frameworks ──────────────────────────────────────────────────────
+langgraph==0.2.53
+langchain==0.3.13
+langchain-core==0.3.29
+langchain-groq==0.2.3
+
+# ── LlamaIndex RAG Pipeline ────────────────────────────────────────────────────
+llama-index==0.12.5
+llama-index-vector-stores-postgres==0.3.2
+llama-index-embeddings-huggingface==0.4.0
+
+# ── OpenShift / Kubernetes Client ──────────────────────────────────────────────
+kubernetes==31.0.0
+
+# ── Database (PostgreSQL) ──────────────────────────────────────────────────────
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.0
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+apscheduler==3.10.4
+
+# ── Configuration & Validation ────────────────────────────────────────────────
+pydantic==2.10.3
+pydantic-settings==2.6.1
+
+# ── TLS Certificate Parsing ────────────────────────────────────────────────────
+cryptography==43.0.3
+
+# ── Dashboard (FastAPI) ────────────────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+jinja2==3.1.4
+
+# ── Email ─────────────────────────────────────────────────────────────────────
+sendgrid==6.11.0
+
+# ── HTTP / Utilities ──────────────────────────────────────────────────────────
+httpx==0.28.1
+tenacity==8.2.3
+python-dotenv==1.0.1
+
+# ── Logging & Observability ───────────────────────────────────────────────────
+structlog==24.4.0

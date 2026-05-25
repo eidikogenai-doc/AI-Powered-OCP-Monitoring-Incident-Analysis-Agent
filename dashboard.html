@@ -1,0 +1,137 @@
+"""
+state.py — LangGraph ClusterState definition.
+
+ClusterState is the single shared memory object that flows through every
+node in the LangGraph pipeline. Each node reads from it and writes only
+the keys it is responsible for.
+
+Import this in agent.py, nodes.py, llm_chains.py, and reporter.py.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, TypedDict
+
+
+class ClusterState(TypedDict, total=False):
+    """
+    Shared state for one full monitoring cycle.
+
+    Fields are grouped by the pipeline stage that writes them.
+
+    ── Initialised by scheduler.py ──────────────────────────────────────────
+    timestamp       : ISO-8601 UTC string — cycle start time
+    cluster_name    : Human-readable cluster identifier
+
+    ── Written by Collection Nodes (tools.py + nodes.py) ────────────────────
+    nodes           : List of node health dicts (name, role, conditions)
+    operators       : List of ClusterOperator status dicts
+    mcpools         : List of MachineConfigPool health dicts
+    etcd            : Dict of etcd endpoint health results
+    pvcs            : List of Pending/Lost PVC dicts
+    pods            : List of failing pod dicts (system namespaces)
+    certs           : List of expiring TLS cert dicts (≤30 days)
+    cp4i_endpoints  : List of CP4I HTTP health-check result dicts
+
+    ── Written by aggregate_node ─────────────────────────────────────────────
+    collected_at    : ISO-8601 UTC timestamp — when collection completed
+    collection_errors : Dict mapping tool name → error message (if any)
+
+    ── Written by analyze_node ──────────────────────────────────────────────
+    failures        : List of failure dicts from LLM analysis
+                      Each: {id, component, resource_name, severity, message, detected_at}
+    summary         : 2-3 sentence cluster health summary from LLM
+
+    ── Written by resolve_node (only when failures exist) ───────────────────
+    resolutions     : List of resolution dicts from LLM
+                      Each: {failure_id, root_cause, steps[], commands[], docs_ref}
+
+    ── Written by rag_node ──────────────────────────────────────────────────
+    rag_results     : Dict mapping failure_id → list of similar past incidents
+
+    ── Written by build_report_node ─────────────────────────────────────────
+    report_html     : Rendered HTML email body string
+
+    ── Written by save_run_node ─────────────────────────────────────────────
+    run_id          : UUID string of the AgentRun record saved to PostgreSQL
+
+    ── Written by send_email_node ───────────────────────────────────────────
+    email_sent      : True once email is dispatched successfully
+    """
+
+    # ── Initialisation ────────────────────────────────────────────────────────
+    timestamp: str
+    cluster_name: str
+
+    # ── Raw collected data ────────────────────────────────────────────────────
+    nodes: List[Dict[str, Any]]
+    operators: List[Dict[str, Any]]
+    mcpools: List[Dict[str, Any]]
+    etcd: Dict[str, Any]
+    pvcs: List[Dict[str, Any]]
+    pods: List[Dict[str, Any]]
+    certs: List[Dict[str, Any]]
+    cp4i_endpoints: List[Dict[str, Any]]
+
+    # ── Aggregation ───────────────────────────────────────────────────────────
+    collected_at: str
+    collection_errors: Dict[str, str]
+
+    # ── LLM Analysis ─────────────────────────────────────────────────────────
+    failures: List[Dict[str, Any]]
+    summary: str
+
+    # ── LLM Resolution ───────────────────────────────────────────────────────
+    resolutions: List[Dict[str, Any]]
+
+    # ── RAG (LlamaIndex) ─────────────────────────────────────────────────────
+    rag_results: Dict[str, List[Dict[str, Any]]]
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    report_html: str
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+    run_id: str
+
+    # ── Email ─────────────────────────────────────────────────────────────────
+    email_sent: bool
+
+
+def initial_state(timestamp: str, cluster_name: str) -> ClusterState:
+    """
+    Create a fresh, empty ClusterState for a new monitoring cycle.
+
+    Args:
+        timestamp    : ISO-8601 UTC string from the scheduler.
+        cluster_name : Cluster display name from config.
+
+    Returns:
+        ClusterState with all collection fields initialised to empty
+        structures so downstream nodes can safely append / update.
+    """
+    return ClusterState(
+        timestamp=timestamp,
+        cluster_name=cluster_name,
+        # Collection
+        nodes=[],
+        operators=[],
+        mcpools=[],
+        etcd={},
+        pvcs=[],
+        pods=[],
+        certs=[],
+        cp4i_endpoints=[],
+        # Aggregation
+        collected_at="",
+        collection_errors={},
+        # LLM
+        failures=[],
+        summary="",
+        resolutions=[],
+        # RAG
+        rag_results={},
+        # Output
+        report_html="",
+        run_id="",
+        email_sent=False,
+    )
